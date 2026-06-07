@@ -1,0 +1,14 @@
+# Terraform state & providers
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+tfplan
+crash.log
+
+# Generated plan / evidence (produced in CI)
+**/plan.json
+**/plan.txt
+evidence/
+
+# OS noise
+.DS_Store
