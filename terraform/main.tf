@@ -35,27 +35,24 @@ locals {
 resource "aws_s3_bucket" "primary" {
   bucket = local.primary_name
 }
-# main.tf (continued)
 
-# SC-28: Protection of information at rest.
-# AES-256 keeps this lab simple. The commented block below shows how you'd
-# switch to KMS-managed keys, covered in a later lab.
+# SC-28: Customer-managed KMS key for at-rest encryption of the primary data bucket.
+resource "aws_kms_key" "bucket" {
+  description             = "CMK for ${var.project_name}-${var.environment} S3 data bucket (SC-28)"
+  deletion_window_in_days = 7
+  enable_key_rotation     = true
+}
+
+# SC-28: Protection of information at rest using the customer-managed KMS key.
 resource "aws_s3_bucket_server_side_encryption_configuration" "primary" {
   bucket = aws_s3_bucket.primary.id
   rule {
     apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
+      sse_algorithm     = "aws:kms"
+      kms_master_key_id = aws_kms_key.bucket.arn
     }
+    bucket_key_enabled = true
   }
-
-  # KMS teaser:
-  # rule {
-  #   apply_server_side_encryption_by_default {
-  #     sse_algorithm     = "aws:kms"
-  #     kms_master_key_id = aws_kms_key.bucket.arn
-  #   }
-  #   bucket_key_enabled = true
-  # }
 }
 
 # CM-6: Versioning preserves prior object states for recovery and audit.
@@ -74,7 +71,6 @@ resource "aws_s3_bucket_public_access_block" "primary" {
   ignore_public_acls      = true
   restrict_public_buckets = true
 }
-# main.tf (continued)
 
 # AU-3 / AU-6: Content of audit records + audit review.
 resource "aws_s3_bucket" "log" {
@@ -94,10 +90,15 @@ resource "aws_s3_bucket_acl" "log" {
   acl        = "log-delivery-write"
 }
 
+# SC-28: Log bucket stays on SSE-S3 (AES256). S3 access-log delivery does not
+# support a customer-managed CMK on the target bucket, so forcing one here would
+# break log delivery. tfsec treats log-target buckets accordingly.
 resource "aws_s3_bucket_server_side_encryption_configuration" "log" {
   bucket = aws_s3_bucket.log.id
   rule {
-    apply_server_side_encryption_by_default { sse_algorithm = "AES256" }
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
   }
 }
 
