@@ -90,6 +90,15 @@ resource "aws_s3_bucket_acl" "log" {
   acl        = "log-delivery-write"
 }
 
+# CM-6: Versioning on the log bucket too, so access-log history is preserved
+# and tamper-evident. Closes the tfsec MEDIUM aws-s3-enable-versioning finding.
+resource "aws_s3_bucket_versioning" "log" {
+  bucket = aws_s3_bucket.log.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
 # SC-28: Log bucket stays on SSE-S3 (AES256). S3 access-log delivery does not
 # support a customer-managed CMK on the target bucket, so forcing one here would
 # break log delivery. tfsec treats log-target buckets accordingly.
