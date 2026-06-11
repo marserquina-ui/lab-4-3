@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  id-token: write        # required for AWS OIDC
+  id-token: write        # required for AWS OIDC + Cosign keyless
   contents: read
   pull-requests: write
 
@@ -65,13 +65,13 @@ jobs:
             done
             echo "]"
           } > ../evidence/conftest-results.json
-          python3 -c '
-          import json, sys
+          FAILS=$(python3 -c '
+          import json
           d = json.load(open("../evidence/conftest-results.json"))
-          fails = sum(len(r.get("failures") or []) for results in d for r in results)
-          print(f"conftest failures: {fails}")
-          sys.exit(0 if fails == 0 else 1)
-          '
+          print(sum(len(r.get("failures") or []) for results in d for r in results))
+          ')
+          echo "conftest failures: $FAILS"
+          echo "CONFTEST_FAILS=$FAILS" >> "$GITHUB_ENV"
 
       - name: tfsec scan
         id: tfsec
@@ -79,23 +79,58 @@ jobs:
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
           tfsec . --format sarif --out ../evidence/tfsec.sarif || true
-          python3 -c '
-          import json, sys
+          HIGH=$(python3 -c '
+          import json
           d = json.load(open("../evidence/tfsec.sarif"))
-          high = sum(
+          print(sum(
               1 for run in d.get("runs", [])
               for r in run.get("results", [])
               if (r.get("level") or "").lower() in ("error","critical","high")
-          )
-          print(f"tfsec high+critical: {high}")
-          sys.exit(0 if high == 0 else 1)
-          '
+          ))
+          ')
+          echo "tfsec high+critical: $HIGH"
+          echo "TFSEC_HIGH=$HIGH" >> "$GITHUB_ENV"
 
       - name: Copy plan into evidence
         if: always()
         run: |
           cp ${{ env.TF_WORKING_DIR }}/plan.json evidence/plan.json
           cp ${{ env.TF_WORKING_DIR }}/plan.txt evidence/plan.txt
+
+      - name: Install Cosign
+        if: always()
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.2.4'
+
+      - name: Bundle + sign + upload to vault
+        id: sign
+        if: always()
+        env:
+          VAULT: ${{ vars.EVIDENCE_VAULT }}
+          RUN_ID: ${{ github.run_id }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          BUNDLE="evidence-${RUN_ID}-${SHA}.tar.gz"
+          ( cd evidence && tar czf "../${BUNDLE}" . )
+          shasum -a 256 "${BUNDLE}" | awk '{print $1}' > "${BUNDLE}.sha256"
+          cosign sign-blob --yes --bundle "${BUNDLE}.sig.bundle" "${BUNDLE}"
+          KEY_PREFIX="runs/${RUN_ID}"
+          aws s3 cp "${BUNDLE}"             "s3://${VAULT}/${KEY_PREFIX}/${BUNDLE}"
+          aws s3 cp "${BUNDLE}.sha256"      "s3://${VAULT}/${KEY_PREFIX}/${BUNDLE}.sha256"
+          aws s3 cp "${BUNDLE}.sig.bundle"  "s3://${VAULT}/${KEY_PREFIX}/${BUNDLE}.sig.bundle"
+          VERSION_ID=$(aws s3api head-object --bucket "${VAULT}" --key "${KEY_PREFIX}/${BUNDLE}" --query VersionId --output text)
+          jq -n \
+            --arg run_id "$RUN_ID" \
+            --arg vault "$VAULT" \
+            --arg bundle_key "${KEY_PREFIX}/${BUNDLE}" \
+            --arg version_id "$VERSION_ID" \
+            --arg sha256 "$(cat ${BUNDLE}.sha256)" \
+            --arg commit "$SHA" \
+            '{run_id:$run_id, vault:$vault, bundle_key:$bundle_key, version_id:$version_id, sha256:$sha256, commit:$commit}' \
+            > receipt.json
+          aws s3 cp receipt.json "s3://${VAULT}/${KEY_PREFIX}/receipt.json"
 
       - name: Upload evidence artifact
         if: always()
@@ -104,3 +139,14 @@ jobs:
           name: grc-evidence-${{ github.run_id }}
           path: evidence/
           retention-days: 90
+
+      - name: Gate decision (fail closed)
+        if: always()
+        run: |
+          echo "conftest failures: ${CONFTEST_FAILS:-unset}"
+          echo "tfsec high+critical: ${TFSEC_HIGH:-unset}"
+          if [[ "${CONFTEST_FAILS:-1}" != "0" || "${TFSEC_HIGH:-1}" != "0" ]]; then
+            echo "GATE FAILED — evidence was still signed and stored in the vault"
+            exit 1
+          fi
+          echo "GATE PASSED"
